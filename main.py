@@ -4,6 +4,10 @@ import random
 import numpy as np
 from models.LMClass import LMClass
 import torch
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 import time
 from datautils import get_loaders
 import multiprocessing
@@ -169,7 +173,7 @@ def parse_arguments():
 
 def setup_ddp():
     dist.init_process_group(
-        backend="nccl",
+        backend="hccl",
         init_method="env://",  # 使用 torchrun 自动设置的环境变量
     )
 
@@ -178,8 +182,8 @@ def get_quant_model(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    torch.npu.manual_seed(args.seed)
+    torch.npu.manual_seed_all(args.seed)
     
     if args.epochs > 0:
         assert args.lwc or args.let
@@ -217,7 +221,7 @@ def get_quant_model(args):
                 del save_dict
         if args.use_ddp:
             dist.barrier()
-        save_dict = torch.load(args.load_rotate_model_path, map_location="cpu")
+        save_dict = torch.load(args.load_rotate_model_path, map_location="cpu", weights_only=False)
         lm.model.load_state_dict(save_dict["model"])
         logger.info(f"load fp16 model from {args.load_rotate_model_path}")
         del save_dict
@@ -265,7 +269,7 @@ def get_quant_model(args):
 
     if args.multigpu:
         gpu_id = get_lowest_occupied_gpu(wait_memory=5000)
-        lm._device = f"cuda:{gpu_id}"
+        lm._device = f"npu:{gpu_id}"
         logger.info(f"set quantization in gpu {gpu_id}")
 
 
@@ -278,7 +282,7 @@ def get_quant_model(args):
         else:
             cache_dataloader = f'{args.cache_dir}/dataloader_{args.net}_{args.calib_dataset}_{args.nsamples}.cache'
         if os.path.exists(cache_dataloader):
-            dataloader = torch.load(cache_dataloader)
+            dataloader = torch.load(cache_dataloader, weights_only=False)
             logger.info(f"load calibration from {cache_dataloader}")
         else:
             if "," in args.calib_dataset:

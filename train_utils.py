@@ -95,16 +95,19 @@ def init_model(config,layers,args,DecoderLayer,model_attr,logger,dev,layer_id_li
                             qlayer.register_parameter(f"{pairs[key]}_smooth_scale",torch.nn.Parameter(scale))
         
         if args.resume and (layer_id < args.resume_layers_num or args.test_mode):
-            try:
-                layer_slider_parameters = slider_parameters[layer_id]
-                if args.wo_lwc:
-                    # import ipdb;ipdb.set_trace()
-                    layer_slider_parameters = { key:layer_slider_parameters[key] for key in layer_slider_parameters.keys() if "bound_factor" not in key}
-                qlayer.load_state_dict(layer_slider_parameters, strict=False)
-                logger.info(f"load slider_parameters from {args.resume} in layer{layer_id} successfully!")
-            except Exception as e:
-                import ipdb;ipdb.set_trace()
-                logger.info(f"load state occurs {e}, skip!")
+            if layer_id not in slider_parameters:
+                # 部分量化（混合精度）时，未量化层没有 checkpoint，直接保持 fp16
+                pass
+            else:
+                try:
+                    layer_slider_parameters = slider_parameters[layer_id]
+                    if args.wo_lwc:
+                        # import ipdb;ipdb.set_trace()
+                        layer_slider_parameters = { key:layer_slider_parameters[key] for key in layer_slider_parameters.keys() if "bound_factor" not in key}
+                    qlayer.load_state_dict(layer_slider_parameters, strict=False)
+                    logger.info(f"load slider_parameters from {args.resume} in layer{layer_id} successfully!")
+                except Exception as e:
+                    logger.info(f"load state occurs {e}, skip!")
         if args.test_mode is True:
             qlayer.float() 
         layers[layer_id] = qlayer
@@ -131,7 +134,10 @@ def get_named_linears(module):
 @torch.no_grad()
 def model_to_inference_mode(layers, args,dtype,dev="cpu"):
     for layer_id in tqdm(range(len(layers))):
-        qlayer = layers[layer_id].to(dev)   
+        qlayer = layers[layer_id]
+        if isinstance(qlayer, torch.nn.Identity):
+            continue
+        qlayer = qlayer.to(dev)   
         # qlayer.to(dtype)
         qlayer.clear_temp_variable()
 
@@ -170,7 +176,7 @@ def obtain_teacher_output(sub_layers, inp, attention_mask, position_ids,position
                     position_embeddings = tuple([position_embeddings[0].to(devs[sub_layer_idx]),position_embeddings[1].to(devs[sub_layer_idx])])
             out = sub_layers[sub_layer_idx](
                 inp, attention_mask=attention_mask, position_ids=position_ids,position_embeddings=position_embeddings,
-            )[0]
+            )
         else:
             if out.device != devs[sub_layer_idx]:
                 out = out.to(devs[sub_layer_idx])
@@ -184,7 +190,7 @@ def obtain_teacher_output(sub_layers, inp, attention_mask, position_ids,position
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
-            )[0]
+            )
     if args.low_memory is True:
         out = out.to("cpu")
     return out
@@ -211,13 +217,13 @@ class SubLayer(torch.nn.Module):
             if sub_layer_idx == 0:
                 out = self.module[sub_layer_idx](
                     x, attention_mask=attention_mask, position_ids=position_ids,position_embeddings=position_embeddings,
-                )[0]
+                )
             else:
                 out = self.module[sub_layer_idx](
                     out,
                     attention_mask=attention_mask,
                     position_ids=position_ids,position_embeddings=position_embeddings,
-                )[0]
+                )
         return out
         
 
@@ -236,7 +242,7 @@ def obtain_studnet_output(sub_layers,quant_mode_sub_layer_list, inp, attention_m
                     position_embeddings = tuple([position_embeddings[0].to(devs[sub_layer_idx]),position_embeddings[1].to(devs[sub_layer_idx])])
             out = sub_layers[sub_layer_idx](
                 inp, attention_mask=attention_mask, position_ids=position_ids,position_embeddings=position_embeddings,
-            )[0]
+            )
         else:
             # if sub_layer_idx == 2:
             #     print("debuf!")
@@ -252,7 +258,7 @@ def obtain_studnet_output(sub_layers,quant_mode_sub_layer_list, inp, attention_m
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
-            )[0]
+            )
             # print("end debug")
     if args.low_memory is True and return_gpu is False:
         out = out.to("cpu")    

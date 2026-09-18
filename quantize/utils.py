@@ -17,8 +17,8 @@ import copy
 
 def get_max_memory_map(ratio=0.95):
     max_memory = {}
-    for i in range(torch.cuda.device_count()):
-        total_mem = torch.cuda.get_device_properties(i).total_memory
+    for i in range(torch.npu.device_count()):
+        total_mem = torch.npu.get_device_properties(i).total_memory
         mem_in_gib = int(total_mem * ratio / (1024 ** 3))  # 转换为 GiB
         max_memory[i] = f"{mem_in_gib}GiB"
     return max_memory
@@ -70,7 +70,7 @@ def evaluate(lm, args, logger):
         # for dataset in ["wikitext2"]:
             cache_testloader = f'{args.cache_dir}/testloader_{args.net}_{dataset}_all.cache'
             if os.path.exists(cache_testloader):
-                testloader = torch.load(cache_testloader)
+                testloader = torch.load(cache_testloader, weights_only=False)
                 logger.info(f"load calibration from {cache_testloader}")
             else:
                 dataloader, testloader = get_loaders(
@@ -125,13 +125,12 @@ def evaluate(lm, args, logger):
     if args.tasks != "":
         args.tasks = args.tasks.split(",")
         import lm_eval
-        from lm_eval import utils as lm_eval_utils
-        from lm_eval.api.registry import ALL_TASKS
         from lm_eval.models.huggingface import HFLM
+        from lm_eval.tasks import TaskManager
         print(f"use lm_eval in {lm_eval}")  
         
-        task_manager = lm_eval.tasks.TaskManager(include_path="./datasets_local/lm_eval_configs/tasks", include_defaults=True)
-        hflm = HFLM(pretrained=lm.model,tokenizer=lm.tokenizer, batch_size=args.lm_eval_batch_size)
+        task_manager = TaskManager(include_path="./datasets_local/lm_eval_configs/tasks", include_defaults=True)
+        hflm = HFLM(pretrained=lm.model,tokenizer=lm.tokenizer, batch_size=args.lm_eval_batch_size, device="npu")
         t_results = lm_eval.simple_evaluate(hflm, tasks=args.tasks, batch_size=args.lm_eval_batch_size,task_manager=task_manager)['results']
 
         metric_vals = {task: round(result.get('acc_norm,none', result['acc,none']), 4) for task, result in t_results.items()}
@@ -226,15 +225,15 @@ def cleanup_memory(verbos=True,logger=None) -> None:
         pass
 
     def total_reserved_mem() -> int:
-        return sum(torch.cuda.memory_reserved(device=i) for i in range(torch.cuda.device_count()))
+        return sum(torch.npu.memory_reserved(device=i) for i in range(torch.npu.device_count()))
 
     memory_before = total_reserved_mem()
 
     # gc.collect and empty cache are necessary to clean up GPU memory if the model was distributed
     gc.collect()
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.npu.is_available():
+        torch.npu.empty_cache()
         memory_after = total_reserved_mem()
         if verbos and logger:
             logger.info(

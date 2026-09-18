@@ -274,7 +274,7 @@ class QuantLlamaAttention(nn.Module):
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
             
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
 
 
@@ -334,6 +334,8 @@ class QuantLlamaDecoderLayer(nn.Module):
         self.use_lora = use_lora
         self.hidden_size = config.hidden_size
         self.lora_attr = lora_attr
+        # 兼容 Qwen3：Qwen3Model.forward 会按层访问 attention_type 来选择 causal mask。
+        self.attention_type = getattr(ori_layer, "attention_type", None)
 
         self.self_attn = QuantLlamaAttention(
             org_module=ori_layer.self_attn,
@@ -441,11 +443,13 @@ class QuantLlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         output_router_logits = False,
+        **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -503,23 +507,10 @@ class QuantLlamaDecoderLayer(nn.Module):
 
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if use_cache:
-            outputs += (present_key_value,)
-
         if self.eval_mode:
             self.clear_temp_variable()
 
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if output_router_logits:
-            outputs += (router_logits,)
-        return outputs        
+        return hidden_states        
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False, quant_rate:float = 1.0):
         # setting weight quantization here does not affect actual forward pass

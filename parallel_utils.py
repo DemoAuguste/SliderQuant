@@ -36,7 +36,7 @@ def nvidia_smi_memory_info():
     return gpu_memory_info
 
 
-num_gpus = torch.cuda.device_count()
+num_gpus = torch.npu.device_count()
 
 
 def get_gpu_memory():
@@ -119,8 +119,8 @@ def assign_layers_to_gpus(layers: List[nn.Module]):
         for gpu_id, tot_memory, allocated_memory in gpus:
             if (tot_memory - allocated_memory * 1.35) > layer_memory:
                 layer_gpu_map[layer] = gpu_id
-                layer.to(f"cuda:{gpu_id}")
-                layer.device = f"cuda:{gpu_id}"
+                layer.to(f"npu:{gpu_id}")
+                layer.device = f"npu:{gpu_id}"
                 print(f"map layer {i} to gpu {gpu_id}, {available_gpus}")
                 mapped = True
                 prev_gpu_id = gpu_id
@@ -135,9 +135,9 @@ def assign_layers_to_gpus(layers: List[nn.Module]):
 def forward_hook_wrapper(gpu_id):
     def forward_hook(module, input, kwargs):
         # breakpoint()
-        input = tuple(_.to(f"cuda:{gpu_id}") for _ in input)
+        input = tuple(_.to(f"npu:{gpu_id}") for _ in input)
         kwargs = {
-            k: v.to(f"cuda:{gpu_id}") if isinstance(v, torch.Tensor) else v
+            k: v.to(f"npu:{gpu_id}") if isinstance(v, torch.Tensor) else v
             for k, v in kwargs.items()
         }
         return input, kwargs

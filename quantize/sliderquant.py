@@ -22,7 +22,7 @@ from quantize.utils import evaluate
 
 def setup_ddp():
     dist.init_process_group(
-        backend="nccl",
+        backend="hccl",
         init_method="env://",  # 使用 torchrun 自动设置的环境变量
     )
 
@@ -85,7 +85,7 @@ def train_one_round(r,epochs,sub_layers,layer_id_list,qdataset,cur_epochs,optimi
         rank = 0
         sampler = None
         shuffle = True
-    qdataloader = DataLoader(qdataset,batch_size=args.batch_size,shuffle=shuffle,num_workers=0,pin_memory=True,sampler=sampler)
+    qdataloader = DataLoader(qdataset,batch_size=args.batch_size,shuffle=shuffle,num_workers=0,pin_memory=(args.low_memory is True),sampler=sampler)
 
 
     
@@ -106,7 +106,10 @@ def train_one_round(r,epochs,sub_layers,layer_id_list,qdataset,cur_epochs,optimi
         
     logger.info(f"Accumulated_loss_num is {Accumulated_loss_num}")
 
-    sub_layers.module.module.train() # 确保开启训练模型
+    if args.use_ddp:
+        sub_layers.module.module.train() # 确保开启训练模型
+    else:
+        sub_layers.train()
 
     for e in range(epochs):
         if args.use_ddp is True:
@@ -137,7 +140,7 @@ def train_one_round(r,epochs,sub_layers,layer_id_list,qdataset,cur_epochs,optimi
                         continue
                     loss_list = []
 
-                    train_context = torch.cuda.amp.autocast(dtype=torch.bfloat16)
+                    train_context = torch.npu.amp.autocast(dtype=torch.bfloat16)
                         
                     with train_context:
                         if args.use_ddp:
@@ -196,8 +199,8 @@ def train_one_round(r,epochs,sub_layers,layer_id_list,qdataset,cur_epochs,optimi
             if args.use_lr_scheduler is True:
                 lr_scheduler.step()
             
-            current_memory = torch.cuda.memory_allocated() / MB
-            max_memory = torch.cuda.max_memory_allocated() / MB
+            current_memory = torch.npu.memory_allocated() / MB
+            max_memory = torch.npu.max_memory_allocated() / MB
 
                 
         cur_epochs += 1
@@ -245,7 +248,7 @@ def sliderquant(
 
     if args.use_ddp:
         rank = dist.get_rank()
-        torch.cuda.set_device(rank)
+        torch.npu.set_device(rank)
     else:
         rank = 0
 
@@ -286,6 +289,14 @@ def sliderquant(
             super().__init__()
             self.module = module
             self.is_llama = False
+
+        def __getattr__(self, name):
+            # 将未命中属性转发给被包装的原始层，兼容 Qwen3 等会在前向中
+            # 读取 decoder_layer.attention_type 的模型。
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
 
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp.cpu()
@@ -351,16 +362,20 @@ def sliderquant(
     if  args.quant_mode in ["fp16"]:
         args.resume = None
     if args.resume:
-        slider_parameters = torch.load(args.resume)
+        slider_parameters = torch.load(args.resume, weights_only=False)
     else:
         slider_parameters = {}
     
     if args.train_resume is not None and args.test_mode is False:
-        slider_parameters = torch.load(args.train_resume)
+        slider_parameters = torch.load(args.train_resume, weights_only=False)
         args.resume = args.train_resume
 
         
-    args.quant_layer_list = [int(layer_id) for layer_id in range(len(layers))]
+    if args.quant_layer_list is not None:
+        # 支持部分层量化（混合精度）：--quant_layer_list "6,7,...,21"
+        args.quant_layer_list = [int(x) for x in args.quant_layer_list.split(",")]
+    else:
+        args.quant_layer_list = [int(layer_id) for layer_id in range(len(layers))]
     logger.info(f"these layer will quant:{args.quant_layer_list}")
 
     if args.use_lora is True:
@@ -429,10 +444,11 @@ def sliderquant(
     if args.layer_windows_scheduler is not None:
         layer_windows_scheduler = []
         for window_str in args.layer_windows_scheduler.split(","):
-            layer_windows_scheduler.append([int(s) for s in window_str.split("-")])
+            start, end = [int(s) for s in window_str.split("-")]
+            layer_windows_scheduler.append(list(range(start, end + 1)))
         num_round = len(layer_windows_scheduler)
         # import ipdb;ipdb.set_trace()
-        assert layer_windows_scheduler[-1][-1] == len(layers) - 1
+        assert layer_windows_scheduler[-1][-1] == args.quant_layer_list[-1]
         
     elif args.fill_window_size is not None:
         total_num_layers = len(layers)
@@ -479,7 +495,30 @@ def sliderquant(
 
     cleanup_memory(logger=logger)
     assert args.quant_step == len(args.quant_rate_list)
-    
+
+    # ==== 修复：部分层量化首窗输入错位 ====
+    # 根因：inps 只捕获 layer 0 输入，但当 layer_windows_scheduler[0][0] > 0 时，
+    #       首个量化窗口（如 MID 的 [6]）直接消费 inps，被喂 embedding 输出，
+    #       而非真实推理中「前置 fp16 层 [0, start) 的输出」→ 训练/推理输入分布错位。
+    _start_layer = layer_windows_scheduler[0][0]
+    if _start_layer > 0 and not args.test_mode:
+        logger.info(f"[partial-quant-fix] forward inps through fp16 layers [0,{_start_layer}) to align first-window input")
+        _prefix_layers = to_dev(layers[0:_start_layer], [dev] * _start_layer)
+        with torch.no_grad():
+            with torch.npu.amp.autocast(dtype=fp16_type):
+                for j in tqdm(range(0, args.nsamples, args.inference_batch_size)):
+                    bs = min(args.inference_batch_size, args.nsamples - j)
+                    inps[j:j+bs] = obtain_teacher_output(
+                        _prefix_layers,
+                        inps[j:j+bs].to(dev),
+                        infer_attention_mask[:bs],
+                        position_ids,
+                        position_embeddings,
+                        args=args,
+                        devs=[dev] * _start_layer,
+                    ).cpu()
+        del _prefix_layers
+        cleanup_memory(logger=logger)
 
     if args.circular_aug:
         assert len(args.quant_rate_list) > 1
@@ -571,7 +610,7 @@ def sliderquant(
             # import ipdb;ipdb.set_trace()
             if  r >= args.start_round:
                 with torch.no_grad():
-                    with torch.cuda.amp.autocast(dtype=fp16_type):
+                    with torch.npu.amp.autocast(dtype=fp16_type):
                         for r_idx in range(args.last_round_inp_num):
                             # get quant_target
                             if  args.use_quant_tar_loss:
@@ -609,7 +648,7 @@ def sliderquant(
             
 
             if args.layers_assigned_gpu is not None:
-                devs = [torch.device(f"cuda:{gpu}") for gpu in args.layers_assigned_gpu.split(",")]
+                devs = [torch.device(f"npu:{gpu}") for gpu in args.layers_assigned_gpu.split(",")]
                 assert len(devs) == len(sub_layers), "layers_assigned_gpu number is not equal to layer number!"
                 sub_layers = to_dev(sub_layers, devs)  #mutil-gpu
             else:
@@ -653,7 +692,7 @@ def sliderquant(
 
 
             if args.use_ddp and r >= args.start_round:
-                sub_layers = sub_layers.cuda()
+                sub_layers = sub_layers.npu()
 
             if args.use_ddp:
                 dist.barrier()
@@ -692,7 +731,7 @@ def sliderquant(
             if r < num_round-1 and sliding_layer>0:  
                 sub_layers = to_dev(sub_layers, [dev] * len(sub_layers))  #single gpu   
                 with torch.no_grad():
-                    with torch.cuda.amp.autocast(dtype=fp16_type):
+                    with torch.npu.amp.autocast(dtype=fp16_type):
                         # get next fp_16
                         for j in tqdm(range(0,args.nsamples,args.inference_batch_size)):
                             bs_local = min(args.inference_batch_size,args.nsamples-j)

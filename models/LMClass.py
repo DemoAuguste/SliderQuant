@@ -14,7 +14,7 @@ class LMClass(BaseLM):
         super().__init__()
 
         self.args = args
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._device = torch.device("npu" if torch.npu.is_available() else "cpu")
         if model_name is not None:
             self.model_name = model_name
         else:

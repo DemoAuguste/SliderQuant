@@ -14,7 +14,7 @@ QWEN_MODEL =  transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM
 QWEN_LATER = transformers.models.qwen2.modeling_qwen2.Qwen2DecoderLayer
 
 
-DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+DEV = torch.device('npu:0') if torch.npu.is_available() else torch.device('cpu')
 
 class RMSN(torch.nn.Module):
     """
