@@ -1,0 +1,35 @@
+model: /workspace/quant-research/model_zoo/Qwen3-1.7B
+wbits: 2
+abits: 16
+epochs: 60
+use_bfloat16: true
+eval_ppl: true
+quant_mode: lora_only   # WXA16 用 lora_only（weight-only + LoRA 补偿）
+batch_size: 3
+low_memory: false
+low_cpu_memory: true
+nsamples: 128
+calib_dataset: wikitext2
+test_datasets: wikitext2
+
+# 滑动窗口/渐进调度
+num_layer: 4
+sliding_layer: 2
+fill_window_size: 4
+
+# LoRA 补偿
+lora_rank: 4
+use_lora: true
+
+# 渐进量化
+quant_rate: 0.5
+
+# 目标生成与 loss
+inference_batch_size: 12
+fp16_act: true
+
+# 优化器
+scale_lr: 0.0
+lora_lr: 0.0005
+lwc_lr: 0.01
+warmup_ratio: 0.0

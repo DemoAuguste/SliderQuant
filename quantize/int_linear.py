@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from quantize.quantizer import UniformAffineQuantizer
+from quantize.quantizer import UniformAffineQuantizer, TernaryQuantizer
 
 
 
@@ -37,7 +37,13 @@ class QuantLinear(nn.Module):
         self.quant_rate = 1.0
         # import ipdb;ipdb.set_trace()
         # initialize quantizer
-        if weight_quant_params["n_bits"] > 1:
+        if weight_quant_params["n_bits"] == 1:
+            self.weight_quantizer = TernaryQuantizer(weight_quant_params, shape=org_module.weight.shape, is_weight_quant=True)
+            if not disable_input_quant:
+                self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
+            else:
+                self.act_quantizer = None
+        elif weight_quant_params["n_bits"] > 1:
             self.weight_quantizer = UniformAffineQuantizer(**weight_quant_params,shape=org_module.weight.shape,is_weight_quant=True)
             if not disable_input_quant:
                 self.act_quantizer = UniformAffineQuantizer(**act_quant_params)
@@ -52,7 +58,10 @@ class QuantLinear(nn.Module):
             weight = self.weight_quantizer(self.temp_weight,self.quant_rate)
             bias = self.temp_bias
         elif self.use_weight_quant:
-            weight = self.weight_quantizer(self.weight,self.quant_rate)
+            if isinstance(self.weight_quantizer, TernaryQuantizer) and self.training:
+                weight = self.weight_quantizer.forward_soft(self.weight)
+            else:
+                weight = self.weight_quantizer(self.weight,self.quant_rate)
             bias = self.bias
         else:
             weight = self.weight

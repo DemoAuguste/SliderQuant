@@ -1,0 +1,49 @@
+model: /workspace/quant-research/model_zoo/Qwen3-1.7B
+wbits: 1
+abits: 16
+group_size: 128
+quant_mode: lora_only
+epochs: 60
+nsamples: 512
+batch_size: 9
+inference_batch_size: 12
+calib_dataset: wikitext2
+test_datasets: wikitext2
+use_bfloat16: true
+fp16_act: false
+low_memory: true
+low_cpu_memory: false
+
+# CAT-Q 三值化
+grad_clip: 1.0
+loss_function: huber
+fill_window_size: 4
+init_round_thd: 0.5
+s0: 30.0
+s_start: 2.0
+learnable_factor_act: sigmoid
+learnable_scale: true
+learnable_mu: true
+learnable_round: true
+shift_mu: true
+drop_quant_mu: true
+ter_scale_type: absmean
+
+# sliding-layer 重构
+num_layer: 4
+sliding_layer: 2
+quant_step: 1
+last_round_inp_num: 1
+use_fp_inp_loss: false
+use_quant_tar_loss: false
+
+# LoRA 精调
+lora_rank: 64
+use_lora: true
+lora_quant: true
+
+# optimizer
+lora_lr: 0.0003
+lwc_lr: 0.0015
+scale_lr: 0.0
+warmup_ratio: 0.0

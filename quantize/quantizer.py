@@ -231,5 +231,116 @@ class UniformAffineQuantizer(nn.Module):
         self.register_buffer('zeros', self.round_zero_point)
         del self.scale
         del self.round_zero_point
+
+
+# ============ CAT-Q：三值量化（LM 可学习调制 + ST 软化三值化）============
+
+
+class _CatQScaleSigmoid(nn.Module):
+    """sigmoid 参数化的可学习因子：sigmoid(bound) * alpha + beta"""
+
+    def __init__(self, dim, alpha=2.0, beta=0.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.bound_factor = nn.Parameter(torch.zeros((dim, 1)))
+
+    def forward(self):
+        return torch.sigmoid(self.bound_factor) * self.alpha + self.beta
+
+
+def _catq_factor_module(kind, dim):
+    if kind == "sigmoid":
+        return _CatQScaleSigmoid(dim, alpha=2.0)
+    raise ValueError(f"Unsupported learnable_factor_act: {kind}")
+
+
+class TernaryQuantizer(nn.Module):
+    """CAT-Q 三值权重量化器（W -> {-1, 0, +1}）。
+
+    - LM：3 个可学习因子 modulate mean(mu) / scale(alpha) / threshold(delta)
+    - ST：训练侧用可微 tanh 软化（forward_soft），推理/weight_merge 侧用硬 round（forward）
+    """
+
+    def __init__(self, weight_quant_params, shape=None, is_weight_quant=True):
+        super().__init__()
+        del is_weight_quant
+        self.group_size = weight_quant_params.get("group_size") or shape[-1]
+        self.shift_mu = weight_quant_params.get("shift_mu", False)
+        self.drop_quant_mu = weight_quant_params.get("drop_quant_mu", False)
+        self.ter_scale_type = weight_quant_params.get("ter_scale_type", "absmean")
+        self.learnable_scale = weight_quant_params.get("learnable_scale", False)
+        self.learnable_mu = weight_quant_params.get("learnable_mu", False)
+        self.learnable_round = weight_quant_params.get("learnable_round", False)
+        self.init_round_thd = weight_quant_params.get("init_round_thd", 0.5)
+        factor_kind = weight_quant_params.get("learnable_factor_act", "sigmoid")
+        self.s0 = weight_quant_params.get("s0", 30.0)
+        # ST 的 sharpness，训练时按 schedule 从 s_start 增大到 s0
+        self.s_start = weight_quant_params.get("s_start", 2.0)
+        self.register_buffer("cur_s", torch.tensor(self.s_start, dtype=torch.float32))
+
+        dim = int(shape[0] * math.ceil(shape[1] / self.group_size))
+        if self.learnable_scale:
+            self.generate_scale_factor = _catq_factor_module(factor_kind, dim)
+        if self.learnable_mu:
+            if not self.shift_mu:
+                raise ValueError("shift_mu must be True when learnable_mu is True")
+            self.generate_mu_factor = _CatQScaleSigmoid(dim, alpha=2.0, beta=-1.0)
+        if self.learnable_round:
+            self.generate_round_factor = _catq_factor_module(factor_kind, dim)
+
+    def set_cur_s(self, s):
+        self.cur_s.fill_(float(s))
+
+    def _stat(self, weight):
+        grouped = weight.reshape(-1, self.group_size)
+        if self.shift_mu:
+            mean = grouped.mean(dim=-1, keepdim=True)
+        else:
+            mean = grouped.new_zeros((grouped.shape[0], 1))
+        if self.ter_scale_type == "absmean":
+            scale = (grouped - mean).abs().mean(dim=-1, keepdim=True) + 1e-6
+        elif self.ter_scale_type == "variance":
+            scale = grouped.std(dim=-1, keepdim=True, unbiased=False) + 1e-6
+        else:
+            raise ValueError(f"Unsupported ter_scale_type: {self.ter_scale_type}")
+        if self.learnable_mu:
+            mean = mean + self.generate_mu_factor() * scale
+        if self.learnable_scale:
+            scale = self.generate_scale_factor() * scale
+        threshold = self.init_round_thd
+        if self.learnable_round:
+            threshold = threshold * self.generate_round_factor()
+        return grouped, mean, scale, threshold
+
+    def _soft_ternarize(self, z, threshold):
+        s = self.cur_s
+        return (torch.tanh(s * (z - threshold)) + torch.tanh(s * (z + threshold))) / (2.0 * torch.tanh(s))
+
+    def _hard_ternarize(self, z, threshold):
+        return torch.clamp(torch.round(z * 0.5 / threshold), -1.0, 1.0)
+
+    def forward_soft(self, weight):
+        """训练侧：tanh 软化三值化（可微）。"""
+        original_shape = weight.shape
+        grouped, mean, scale, threshold = self._stat(weight)
+        z = (grouped - mean) / scale
+        t = self._soft_ternarize(z, threshold)
+        quantized = t * scale
+        if self.shift_mu and not self.drop_quant_mu:
+            quantized = quantized + mean
+        return quantized.reshape(original_shape)
+
+    def forward(self, weight, quant_rate=1.0):
+        """推理/weight_merge 侧：硬三值化。"""
+        del quant_rate
+        original_shape = weight.shape
+        grouped, mean, scale, threshold = self._stat(weight)
+        z = (grouped - mean) / scale
+        t = self._hard_ternarize(z, threshold)
+        quantized = t * scale
+        if self.shift_mu and not self.drop_quant_mu:
+            quantized = quantized + mean
+        return quantized.reshape(original_shape)
     
 

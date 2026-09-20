@@ -42,3 +42,7 @@ rotate_models/
 /GPTQ
 /results
 AGENTS.md
+*.sh
+*.gz
+*.log
+*.lock

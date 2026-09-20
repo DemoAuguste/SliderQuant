@@ -186,7 +186,8 @@ def train_one_round(r,epochs,sub_layers,layer_id_list,qdataset,cur_epochs,optimi
                     import ipdb;ipdb.set_trace()
                 assert math.isfinite(loss.item()),"Loss is NAN, stopping training!"
             if args.grad_clip is not None:
-                total_norm = torch.nn.utils.clip_grad_norm_(sub_layers.module.module.parameters(), max_norm=args.grad_clip)
+                params = sub_layers.module.module.parameters() if args.use_ddp else sub_layers.parameters()
+                total_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=args.grad_clip)
                 # logger.info(f"Gradient norm: {total_norm:.4f} Max norm: {args.grad_clip}")
             
             optimizer.step()

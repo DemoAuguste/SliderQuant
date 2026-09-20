@@ -121,6 +121,7 @@ def parse_arguments():
     parser.add_argument("--fill_window_size", type=int, default=None, help="window size used for progressive layer scheduling")
     parser.add_argument("--grad_clip", default=None, type=float, help="maximum gradient norm for clipping; None disables clipping")
     parser.add_argument("--loss_function", default="mse", type=str, choices=["mse", "huber"], help="loss function used for training rounds")
+    parser.add_argument("--huber_loss_max", type=float, default=1.0, help="max delta for huber loss")
     parser.add_argument("--alpha", type=float, default=0.5, help="mixing factor for the current loss setup")
     parser.add_argument("--auto_lr_scale", default=True, action="store_true", help="automatically scale learning rates by the active quantization ratio")
     parser.add_argument("--scale_lr", type=float, default=5e-3, help="learning rate for learned scale parameters")
@@ -137,6 +138,16 @@ def parse_arguments():
     parser.add_argument("--last_round_inp_num", default=1, type=int, help="number of previous-round activations cached for alignment losses")
     parser.add_argument("--symmetric", default=False, action="store_true", help="use symmetric weight quantization")
     parser.add_argument("--disable_zero_point", default=False, action="store_true", help="disable zero-point in quantization")
+    parser.add_argument("--shift_mu", default=False, action="store_true", help="[CAT-Q] subtract group mean before ternarization")
+    parser.add_argument("--drop_quant_mu", default=False, action="store_true", help="[CAT-Q] drop group mean in quantized weights")
+    parser.add_argument("--ter_scale_type", type=str, default="absmean", choices=["absmean", "variance"], help="[CAT-Q] ternary scale type")
+    parser.add_argument("--learnable_scale", default=False, action="store_true", help="[CAT-Q] learn scale factor")
+    parser.add_argument("--learnable_mu", default=False, action="store_true", help="[CAT-Q] learn mu factor")
+    parser.add_argument("--learnable_round", default=False, action="store_true", help="[CAT-Q] learn threshold factor")
+    parser.add_argument("--learnable_factor_act", type=str, default="sigmoid", choices=["sigmoid", "double_sigmoid", "softplus", "exp"], help="[CAT-Q] factor activation")
+    parser.add_argument("--init_round_thd", type=float, default=0.5, help="[CAT-Q] initial ternary threshold")
+    parser.add_argument("--s0", type=float, default=30.0, help="[CAT-Q] ST sharpness (final)")
+    parser.add_argument("--s_start", type=float, default=2.0, help="[CAT-Q] ST sharpness (initial)")
     parser.add_argument("--a_dynamic_method", type=str, default="per_token", choices=["per_token"], help="activation quantization dynamic method")
     parser.add_argument("--w_dynamic_method", type=str, default="per_channel", choices=["per_channel"], help="weight quantization dynamic method")
     parser.add_argument("--limit", type=int, default=-1, help="limit the number of evaluation samples; -1 means no limit")
@@ -237,6 +248,17 @@ def get_quant_model(args):
         "group_size": args.group_size,
         "lwc":args.lwc,
         "disable_zero_point": args.disable_zero_point,
+        # CAT-Q 三值量化参数
+        "shift_mu": args.shift_mu,
+        "drop_quant_mu": args.drop_quant_mu,
+        "ter_scale_type": args.ter_scale_type,
+        "learnable_scale": args.learnable_scale,
+        "learnable_mu": args.learnable_mu,
+        "learnable_round": args.learnable_round,
+        "learnable_factor_act": args.learnable_factor_act,
+        "init_round_thd": args.init_round_thd,
+        "s0": args.s0,
+        "s_start": args.s_start,
     }
     args.act_quant_params = {
         "n_bits":  args.abits,

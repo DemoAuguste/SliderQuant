@@ -1,0 +1,35 @@
+model: /workspace/quant-research/model_zoo/Qwen3-1.7B
+wbits: 3
+abits: 16
+epochs: 60
+use_bfloat16: true
+eval_ppl: true
+quant_mode: lora_only
+
+# 混合精度：只量化中间 6~21 层，首尾 0~5、22~27 保持 FP16
+quant_layer_list: "6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21"
+layer_windows_scheduler: "6-9,8-11,10-13,12-15,14-17,16-19,18-21"
+
+batch_size: 3
+low_memory: true
+low_cpu_memory: true
+nsamples: 128
+seqlen: 2048
+calib_dataset: wikitext2
+test_datasets: wikitext2
+
+num_layer: 4
+sliding_layer: 2
+fill_window_size: 4
+
+lora_rank: 4
+use_lora: true
+quant_rate: 0.5
+
+inference_batch_size: 4
+fp16_act: true
+
+scale_lr: 0.0
+lora_lr: 0.0005
+lwc_lr: 0.01
+warmup_ratio: 0.0

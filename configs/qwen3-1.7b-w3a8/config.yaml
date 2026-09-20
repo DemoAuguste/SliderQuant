@@ -1,0 +1,35 @@
+model: /workspace/quant-research/model_zoo/Qwen3-1.7B
+wbits: 3
+abits: 8
+epochs: 20
+use_bfloat16: true
+eval_ppl: true
+quant_mode: slider   # 权重+激活量化（LET smooth + 滑动窗口）
+batch_size: 3
+low_memory: true
+low_cpu_memory: true
+nsamples: 128
+calib_dataset: wikitext2
+test_datasets: wikitext2
+
+# 滑动窗口
+num_layer: 4
+sliding_layer: 2
+
+# LoRA 补偿
+lora_rank: 4
+use_lora: true
+
+# 渐进量化
+quant_step: 2
+quant_rate: 0.5
+
+# 目标生成与 loss
+inference_batch_size: 12
+fp16_act: true
+
+# 优化器
+scale_lr: 0.001      # LET smooth 缩放学习率（slider 模式非 0）
+lora_lr: 0.0001
+lwc_lr: 0.01
+warmup_ratio: 0.0
