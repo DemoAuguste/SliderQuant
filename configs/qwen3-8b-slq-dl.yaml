@@ -1,0 +1,23 @@
+# SLQ P1 配置: Qwen3-8B DL 搜索 (EAR>=0.985, 温度 0.6)
+model: /opt/zh/train/model_from_hf/qwen3_hf
+net: qwen3
+use_bfloat16: true
+group_mode: split
+group_size: 128
+symmetric: false
+bits_list: [3, 4, 5, 6, 7, 8]
+anchor_bits: 4
+topk: 10
+temperature: 0.6
+nsamples: 512
+sens_nsamples: 128
+seqlen: 2048
+calib_dataset: wikitext2
+cache_dir: /opt/zh/train/SliderQuant/cache
+seed: 2
+dl_target_ear: 0.985
+dl_relative_margin: 0.0
+tl_target_recovery: 0.99
+tl_calib_bits: 4
+eval_tasks: piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande
+lm_eval_batch_size: 8

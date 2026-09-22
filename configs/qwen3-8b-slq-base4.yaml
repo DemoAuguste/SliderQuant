@@ -1,0 +1,23 @@
+# SLQ P1 配置: Qwen3-8B uniform-4 基线 + self + γ² 对照 (温度 0.6)
+model: /opt/zh/train/model_from_hf/qwen3_hf
+net: qwen3
+use_bfloat16: true
+group_mode: split          # 每层 attn/mlp 两组 (36 层 = 72 组)
+group_size: 128
+symmetric: false
+bits_list: [3, 4, 5, 6, 7, 8]
+anchor_bits: 4
+topk: 10
+temperature: 0.6           # 论文 Qwen3 推荐采样温度, 使 top-10 质量≈0.99
+nsamples: 512
+sens_nsamples: 256        # 敏感度估计用 256 样本 (验证用全量 512)
+seqlen: 2048
+calib_dataset: wikitext2
+cache_dir: /opt/zh/train/SliderQuant/cache
+seed: 2
+dl_target_ear: 0.985       # 8B 温度后 self top-10 质量 0.988, DL 绝对目标取 0.985
+dl_relative_margin: 0.0    # 关闭相对 margin, 用纯绝对目标
+tl_target_recovery: 0.99
+tl_calib_bits: 4          # 8B 用 uniform-4 作 TL 锚点 (论文基准)
+eval_tasks: piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande
+lm_eval_batch_size: 8

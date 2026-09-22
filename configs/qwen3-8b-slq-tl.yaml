@@ -1,0 +1,22 @@
+# SLQ P1 配置: Qwen3-8B TL 搜索 (恢复率>=0.99, 温度 0.6, 锚点 6bit)
+# env1: /opt/zh/train/model_from_hf/qwen3_hf ; env2: /opt/zh/quant-research/model_zoo/Qwen3-8B
+model: /opt/zh/quant-research/model_zoo/Qwen3-8B
+net: qwen3
+use_bfloat16: true
+group_mode: split
+group_size: 128
+symmetric: false
+bits_list: [3, 4, 5, 6, 7, 8]
+anchor_bits: 4
+topk: 10
+temperature: 0.6
+nsamples: 512
+sens_nsamples: 128
+seqlen: 2048
+calib_dataset: wikitext2
+cache_dir: /opt/zh/SLQ/SliderQuant/cache
+seed: 2
+tl_target_recovery: 0.99
+tl_calib_bits: 6
+eval_tasks: piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande
+lm_eval_batch_size: 8
