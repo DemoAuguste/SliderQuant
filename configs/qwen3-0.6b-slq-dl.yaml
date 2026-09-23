@@ -1,0 +1,20 @@
+# SLQ P0 配置: Qwen3-0.6B DL 搜索 (EAR>=0.99)
+model: /opt/zh/train/model_from_hf/qwen3_0_6b
+net: qwen3
+use_bfloat16: true
+group_mode: split
+group_size: 128
+symmetric: false
+bits_list: [3, 4, 5, 6, 7, 8]
+anchor_bits: 4
+topk: 10
+nsamples: 128
+sens_nsamples: 64          # 敏感度估计用更少样本加速 (验证用全量 128)
+seqlen: 2048
+calib_dataset: wikitext2
+cache_dir: /opt/zh/train/SliderQuant/cache
+seed: 2
+dl_target_ear: 0.99
+tl_target_recovery: 0.99
+eval_tasks: piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande
+lm_eval_batch_size: 8

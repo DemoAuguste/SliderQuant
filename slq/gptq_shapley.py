@@ -92,12 +92,16 @@ def collect_activations(model, groups, inputs, device, n_rows=1024, batch=4):
 
 def gptq_group_weights(groups, m, bits, act, group_size=128, symmetric=False, damp=0.01):
     """对组 m 内每个 Linear 做 GPTQ 量化, 返回 [CPU bf16 权重列表] (不写模型)。"""
+    import time
     out = []
+    t0 = time.time()
     for mod in groups[m]["modules"]:
         X = act.get(id(mod))
         w = mod.weight.detach()
-        dq = gptq_quantize_weight(w, X, bits, group_size, symmetric, damp)
+        dq = gptq_quantize_weight(w, X, bits, group_size, symmetric, damp, verbose=True)
         out.append(dq.detach().to("cpu"))
+    print(f"  [gptq-group] m={m} name={groups[m]['name']} "
+          f"mods={len(groups[m]['modules'])} done in {time.time() - t0:.1f}s", flush=True)
     return out
 
 
@@ -209,6 +213,11 @@ def search_tl_predicted(sens, bits_list, target_kl, rho=1.0, tol_bits=0.02):
 
 def apply_config_gptq(model, groups, alloc, act, group_size=128, symmetric=False):
     """按 alloc 位宽配置, 逐组 GPTQ 量化并原地写回。"""
-    weights = [gptq_group_weights(groups, m, int(alloc[m]), act, group_size, symmetric)
-               for m in range(len(groups))]
+    import time
+    weights = []
+    t_all = time.time()
+    for m in range(len(groups)):
+        weights.append(gptq_group_weights(groups, m, int(alloc[m]), act, group_size, symmetric))
+        print(f"  [apply-gptq] group {m + 1}/{len(groups)} done", flush=True)
     write_all(groups, weights)
+    print(f"[apply-gptq] all {len(groups)} groups quantized in {time.time() - t_all:.1f}s", flush=True)
