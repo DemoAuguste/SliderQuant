@@ -133,19 +133,69 @@ def main():
                   f, ensure_ascii=False, indent=2)
     print(f"[GQ] sensitivity saved to {sens_json}")
 
-    # ---------- TL 单点标定 + 预测二分 (论文 Algorithm 2) ----------
+    # ---------- TL 单点标定 + 预测二分 + re-anchor (论文 Algorithm 2) ----------
+    from slq.gptq_shapley import predicted_kl
     alpha = (1.0 - anchor_rec) / max(kl_cal, 1e-6)
     d_thresh = (1.0 - target_rec) / alpha
-    from slq.gptq_shapley import predicted_kl
     d_pred_anchor = predicted_kl(sens, [calib_bits] * len(groups))
     rho = kl_cal / max(d_pred_anchor, 1e-8)
     print(f"[GQ] single-point: alpha={alpha:.4f} D_thresh={d_thresh:.5f} "
           f"D_pred_anchor={d_pred_anchor:.5f} rho={rho:.4f}")
-    alloc, avg_bits = search_tl_predicted(sens, bits_list, d_thresh, rho)
-    if alloc is None:
-        raise RuntimeError("TL search failed (no feasible config)")
+
+    # 论文 Algorithm 2 的 re-anchor 循环:
+    #   guardrail 失败 (实测/预测 相对锚点 rho 偏离 >2x) 时, 用实测 KL 重新估计 rho,
+    #   并把搜索下界抬升到失败位宽, 重新二分, 直到 guardrail 通过或达到最大迭代。
+    from slq.gptq_shapley import search_tl_predicted
+    max_reanchor = cfg.get("max_reanchor", 4)
+    failed_bits = 0.0
+    final_alloc = None
+    best_kl_actual = None
+    for re_i in range(max_reanchor + 1):
+        alloc, avg_bits = search_tl_predicted(sens, bits_list, d_thresh, rho,
+                                              skip_below=failed_bits)
+        if alloc is None:
+            raise RuntimeError("TL search failed (no feasible config)")
+        desc = describe_config(groups, alloc)
+        print(f"[GQ][iter{re_i}] predicted alloc: avg_bits={desc['avg_bits']} "
+              f"per_bits={desc['per_bits']}")
+
+        restore_weights(groups, snapshot)
+        apply_config_gptq(model, groups, alloc, act, group_size, symmetric)
+        # guardrail 的 KL 必须与预测/锚点在【同一批样本】上测, 否则样本数差异本身
+        # 就会污染 ratio (论文单点标定协议: 锚点与候选同协议)。sens 集用于校验,
+        # 全量集只用于最终 lm_eval benchmark。
+        _, kl_actual = model_metrics(model, sens_inputs, sens_ref, device, topk=topk,
+                                     temperature=temperature)
+        d_pred = predicted_kl(sens, alloc)
+        rho_actual = kl_actual / max(d_pred, 1e-8)
+        ratio = rho_actual / max(rho, 1e-8)
+        print(f"[GQ][iter{re_i}] guardrail(sens): actual_kl={kl_actual:.5f} "
+              f"predicted_kl={d_pred:.5f} rho_actual={rho_actual:.4f} "
+              f"ratio_vs_anchor_rho={ratio:.3f}")
+
+        if 0.5 <= ratio <= 2.0:
+            final_alloc = alloc
+            best_kl_actual = kl_actual
+            result["guardrail"] = "ok"
+            result["reanchor_iters"] = re_i
+            print(f"[GQ] guardrail OK at iter {re_i}")
+            break
+        # re-anchor: 用实测 KL 重估 rho, 并强制后续搜索位宽 >= 当前实测位宽
+        failed_bits = desc["avg_bits"]
+        rho = rho_actual
+        print(f"[GQ] guardrail violated at iter {re_i} (ratio={ratio:.3f}), "
+              f"re-anchor rho->{rho:.4f}, floor avg_bits->{failed_bits:.3f}")
+        result.setdefault("reanchor_hist", []).append(
+            {"iter": re_i, "avg_bits": desc["avg_bits"], "kl_actual": kl_actual,
+             "predicted_kl": d_pred, "rho_actual": rho_actual, "ratio": ratio})
+        best_kl_actual = kl_actual  # 未通过时记录最后一次实测, 便于人工判断
+    else:
+        # 跑满仍未通过: 用最后一次配置并标记
+        final_alloc = alloc
+        result["guardrail"] = "unverified"
+
+    alloc = final_alloc
     desc = describe_config(groups, alloc)
-    print(f"[GQ] predicted alloc: avg_bits={desc['avg_bits']} per_bits={desc['per_bits']}")
     result["avg_bits"] = desc["avg_bits"]
     result["alloc"] = alloc
     result["per_bits"] = desc["per_bits"]
@@ -154,23 +204,7 @@ def main():
     result["rho"] = rho
     result["d_pred_anchor"] = d_pred_anchor
     result["predicted_kl"] = predicted_kl(sens, alloc)
-
-    # ---------- guardrail: 实测 KL (论文: 实测/预测 相对 rho 偏离 >2x 则拒绝) ----------
-    restore_weights(groups, snapshot)
-    apply_config_gptq(model, groups, alloc, act, group_size, symmetric)
-    _, kl_actual = model_metrics(model, inputs, ref, device, topk=topk, temperature=temperature)
-    d_pred = predicted_kl(sens, alloc)
-    rho_actual = kl_actual / max(d_pred, 1e-8)
-    ratio = rho_actual / max(rho, 1e-8)
-    print(f"[GQ] guardrail: actual_kl={kl_actual:.5f} predicted_kl={d_pred:.5f} "
-          f"rho_actual={rho_actual:.4f} ratio_vs_anchor_rho={ratio:.3f}")
-    result["kl_actual"] = kl_actual
-    result["rho_actual"] = rho_actual
-    if ratio > 2.0 or ratio < 0.5:
-        print("[GQ] WARNING: guardrail violated (ratio >2x), re-anchoring needed")
-        result["guardrail"] = "violated"
-    else:
-        result["guardrail"] = "ok"
+    result["kl_actual"] = best_kl_actual
 
     # ---------- 最终 benchmark ----------
     if not args.skip_bench:

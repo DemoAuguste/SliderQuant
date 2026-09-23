@@ -134,7 +134,19 @@ def shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=2,
     random.seed(seed)
     torch.manual_seed(seed)
 
+    # 关键: 保存原始权重快照。Wb 必须从原始权重做 GPTQ, 否则会二次量化
+    # (当前模型可能已被 write_all(Wmax) 写成 8bit, 再此基础上量 b-bit 会膨胀边际)。
+    orig = [mod.weight.detach().clone() for grp in groups for mod in grp["modules"]]
+
+    def _restore_orig():
+        i = 0
+        for grp in groups:
+            for mod in grp["modules"]:
+                mod.weight.copy_(orig[i])
+                i += 1
+
     print(f"[shapley] precompute W(bmax={bmax}) for {M} groups (GPTQ)...")
+    _restore_orig()  # Wmax 也须从原始权重计算
     Wmax = [gptq_group_weights(groups, m, bmax, act, group_size, symmetric) for m in range(M)]
     write_all(groups, Wmax)
     base_ear, base_kl = metrics_fn()
@@ -144,7 +156,8 @@ def shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=2,
     for b in bits_list:
         if b >= bmax:
             continue
-        print(f"[shapley] bitwidth {b}: precompute W(b={b}) (GPTQ)...")
+        print(f"[shapley] bitwidth {b}: precompute W(b={b}) from ORIGINAL weights (GPTQ)...")
+        _restore_orig()  # 修复二次量化: 从原始权重计算 Wb
         Wb = [gptq_group_weights(groups, m, b, act, group_size, symmetric) for m in range(M)]
         for p in range(n_perm):
             perm = list(range(M))
@@ -176,10 +189,14 @@ def predicted_kl(sens, alloc, m2b=None):
     return base_kl + sum(c_kl[m].get(int(alloc[m]), 0.0) for m in range(len(alloc)))
 
 
-def search_tl_predicted(sens, bits_list, target_kl, rho=1.0, tol_bits=0.02):
+def search_tl_predicted(sens, bits_list, target_kl, rho=1.0, tol_bits=0.02,
+                        skip_below=0.0):
     """论文式预测二分: 找最小 avg_bits 使 rho*predicted_kl(alloc) <= target_kl。
 
     使用 DP 多选背包 (等价 ILP) 最小化预测 KL, 在预算上二分。
+
+    skip_below: re-anchor 时强制搜索平均位宽不低于该值 (float). 语义为预算下界,
+        防止 re-anchor 后回退到已被 guardrail 拒绝的更低位宽。
     """
     params = sens["params"]
     c_kl = sens["c_kl"]
@@ -191,6 +208,7 @@ def search_tl_predicted(sens, bits_list, target_kl, rho=1.0, tol_bits=0.02):
         return rho * predicted_kl(sens, alloc) <= target_kl
 
     lo_b, hi_b = min(bits_list), max(bits_list)
+    lo_b = max(lo_b, float(skip_below or 0.0))
     best = None
     for _ in range(30):
         mid = (lo_b + hi_b) / 2
