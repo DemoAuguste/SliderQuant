@@ -29,6 +29,8 @@ def parse_args():
     ap.add_argument("--n_perm", type=int, default=2, help="Shapley 随机排列数 P")
     ap.add_argument("--sens_nsamples", type=int, default=None)
     ap.add_argument("--n_gptq_rows", type=int, default=1024, help="每 Linear GPTQ 校准行数")
+    ap.add_argument("--n_groups", type=int, default=None,
+                    help="只取前 N 组用于端到端快速验证 (None=全部)")
     ap.add_argument("--apply_config", default=None, help="eval 模式位宽 json")
     ap.add_argument("--skip_bench", action="store_true")
     return ap.parse_args()
@@ -51,6 +53,9 @@ def main():
 
     model, tokenizer, device = load_model(cfg["model"], cfg.get("use_bfloat16", True), device)
     groups = build_groups(model, cfg.get("group_mode", "split"))
+    if args.n_groups is not None:
+        groups = groups[:args.n_groups]
+        print(f"[GQ] ** E2E-FAST: only using first {len(groups)} groups for validation**")
     print(f"[GQ] groups: {len(groups)}")
     inputs = load_calibration(args, cfg, cfg["model"])
     topk = cfg.get("topk", 10)

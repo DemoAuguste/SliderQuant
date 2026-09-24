@@ -139,11 +139,12 @@ def shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=2,
     orig = [mod.weight.detach().clone() for grp in groups for mod in grp["modules"]]
 
     def _restore_orig():
-        i = 0
-        for grp in groups:
-            for mod in grp["modules"]:
-                mod.weight.copy_(orig[i])
-                i += 1
+        with torch.no_grad():  # 必须 no_grad, 否则对 requires_grad 叶子 copy_ 报错
+            i = 0
+            for grp in groups:
+                for mod in grp["modules"]:
+                    mod.weight.copy_(orig[i])
+                    i += 1
 
     print(f"[shapley] precompute W(bmax={bmax}) for {M} groups (GPTQ)...")
     _restore_orig()  # Wmax 也须从原始权重计算
