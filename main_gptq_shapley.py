@@ -33,6 +33,12 @@ def parse_args():
                     help="只取前 N 组用于端到端快速验证 (None=全部)")
     ap.add_argument("--apply_config", default=None, help="eval 模式位宽 json")
     ap.add_argument("--skip_bench", action="store_true")
+    ap.add_argument("--sens_json", default=None,
+                    help="复用已保存的 shapley sensitivity (gq_sens.json), 跳过预计算")
+    ap.add_argument("--resume_values", default=None,
+                    help="复用已有 gq_slq_tl.json 的 bf16/anchor 数值, 跳过基线阶段")
+    ap.add_argument("--thresh_scale", type=float, default=1.0,
+                    help="D_thresh 安全系数 (<1 更保守, 补偿线性恢复模型在低位宽的低估)")
     return ap.parse_args()
 
 
@@ -84,37 +90,57 @@ def main():
     result = {"config": cfg, "n_groups": len(groups), "n_perm": n_perm,
               "sens_nsamples": sens_n}
 
+    # ---------- 可选: 从上次结果复用 bf16/anchor 数值 ----------
+    resumed = {}
+    if args.resume_values:
+        with open(args.resume_values, "r", encoding="utf-8") as f:
+            resumed = json.load(f)
+        need = ["bf16_avg", "bf16_scores", "kl_cal", "anchor_recovery"]
+        miss = [k for k in need if k not in resumed]
+        if miss:
+            raise RuntimeError(f"resume_values 缺少字段: {miss}")
+        print(f"[GQ] resume bf16/anchor values from {args.resume_values}")
+
     # ---------- BF16 基线 (缓存) ----------
-    bf16_cache = os.path.join(out_dir, "gq_bf16_scores.json")
-    if os.path.exists(bf16_cache):
-        with open(bf16_cache, "r", encoding="utf-8") as f:
+    if resumed:
+        bf16_scores = resumed["bf16_scores"]
+        print(f"[GQ] load BF16 scores from resume json")
+    elif os.path.exists(os.path.join(out_dir, "gq_bf16_scores.json")):
+        with open(os.path.join(out_dir, "gq_bf16_scores.json"), "r", encoding="utf-8") as f:
             bf16_scores = json.load(f)
-        print(f"[GQ] load BF16 scores from {bf16_cache}")
+        print(f"[GQ] load BF16 scores from cache")
     else:
         bf16_scores = eval_lm_eval(model, tokenizer, tasks, cfg.get("lm_eval_batch_size", "8"), device)
-        with open(bf16_cache, "w", encoding="utf-8") as f:
+        with open(os.path.join(out_dir, "gq_bf16_scores.json"), "w", encoding="utf-8") as f:
             json.dump(bf16_scores, f, ensure_ascii=False, indent=2)
-    bf16_avg = sum(bf16_scores.values()) / len(bf16_scores)
+    bf16_avg = resumed.get("bf16_avg") or (sum(bf16_scores.values()) / len(bf16_scores))
     print(f"[GQ] BF16 avg-{len(bf16_scores)}: {bf16_avg:.5f}")
 
     # ---------- 锚点: uniform-calib_bits (GPTQ) ----------
-    print(f"[GQ] anchor: uniform-{calib_bits} (GPTQ), KL + benchmark...")
-    apply_config_gptq(model, groups, [calib_bits] * len(groups), act, group_size, symmetric)
-    _, kl_cal = model_metrics(model, sens_inputs, sens_ref, device, topk=topk,
-                              temperature=temperature)
-    anchor_cache = os.path.join(out_dir, f"gq_anchor_{calib_bits}b_scores.json")
-    if os.path.exists(anchor_cache):
-        with open(anchor_cache, "r", encoding="utf-8") as f:
-            anchor_scores = json.load(f)
-        print(f"[GQ] load anchor scores from {anchor_cache}")
+    if resumed:
+        kl_cal = resumed["kl_cal"]
+        anchor_scores = resumed.get("anchor_scores") or bf16_scores
+        anchor_avg = resumed["anchor_recovery"] * bf16_avg
+        anchor_rec = resumed["anchor_recovery"]
+        print(f"[GQ] resume anchor: KL={kl_cal:.5f} recovery={anchor_rec:.5f} (跳过 GPTQ/eval)")
     else:
-        anchor_scores = eval_lm_eval(model, tokenizer, tasks, cfg.get("lm_eval_batch_size", "8"), device)
-        with open(anchor_cache, "w", encoding="utf-8") as f:
-            json.dump(anchor_scores, f, ensure_ascii=False, indent=2)
-    anchor_avg = sum(anchor_scores.values()) / len(anchor_scores)
-    anchor_rec = anchor_avg / bf16_avg
-    print(f"[GQ] anchor uniform-{calib_bits}: KL={kl_cal:.5f} avg={anchor_avg:.5f} "
-          f"recovery={anchor_rec:.5f}")
+        print(f"[GQ] anchor: uniform-{calib_bits} (GPTQ), KL + benchmark...")
+        apply_config_gptq(model, groups, [calib_bits] * len(groups), act, group_size, symmetric)
+        _, kl_cal = model_metrics(model, sens_inputs, sens_ref, device, topk=topk,
+                                  temperature=temperature)
+        anchor_cache = os.path.join(out_dir, f"gq_anchor_{calib_bits}b_scores.json")
+        if os.path.exists(anchor_cache):
+            with open(anchor_cache, "r", encoding="utf-8") as f:
+                anchor_scores = json.load(f)
+            print(f"[GQ] load anchor scores from {anchor_cache}")
+        else:
+            anchor_scores = eval_lm_eval(model, tokenizer, tasks, cfg.get("lm_eval_batch_size", "8"), device)
+            with open(anchor_cache, "w", encoding="utf-8") as f:
+                json.dump(anchor_scores, f, ensure_ascii=False, indent=2)
+        anchor_avg = sum(anchor_scores.values()) / len(anchor_scores)
+        anchor_rec = anchor_avg / bf16_avg
+        print(f"[GQ] anchor uniform-{calib_bits}: KL={kl_cal:.5f} avg={anchor_avg:.5f} "
+              f"recovery={anchor_rec:.5f}")
     result["kl_cal"] = kl_cal
     result["anchor_recovery"] = anchor_rec
     result["bf16_avg"] = bf16_avg
@@ -123,25 +149,43 @@ def main():
 
     # ---------- 恢复原始权重, 然后 Shapley 敏感度 ----------
     restore_weights(groups, snapshot)
-    print(f"[GQ] shapley sensitivity (P={n_perm}, sens_n={sens_n}, bits={bits_list})...")
-    sens = shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=n_perm,
-                               group_size=group_size, symmetric=symmetric,
-                               seed=cfg.get("seed", 2))
-    result["sens_meta"] = {"base_ear": sens["base_ear"], "base_kl": sens["base_kl"],
-                           "params": sens["params"], "n_perm": sens["n_perm"]}
-    sens_json = os.path.join(out_dir, "gq_sens.json")
-    with open(sens_json, "w", encoding="utf-8") as f:
-        json.dump({"base_ear": sens["base_ear"], "base_kl": sens["base_kl"],
-                   "c_ear": {str(m): {str(b): v for b, v in cm.items()} for m, cm in sens["c_ear"].items()},
-                   "c_kl": {str(m): {str(b): v for b, v in cm.items()} for m, cm in sens["c_kl"].items()},
-                   "params": sens["params"], "n_perm": sens["n_perm"]},
-                  f, ensure_ascii=False, indent=2)
-    print(f"[GQ] sensitivity saved to {sens_json}")
+    if args.sens_json:
+        with open(args.sens_json, "r", encoding="utf-8") as f:
+            raw_sens = json.load(f)
+        # gq_sens.json 的 c_ear/c_kl 以 str key 存储, 转回 int
+        sens = {"base_ear": raw_sens["base_ear"], "base_kl": raw_sens["base_kl"],
+                "c_ear": {int(m): {int(b): v for b, v in cm.items()}
+                          for m, cm in raw_sens["c_ear"].items()},
+                "c_kl": {int(m): {int(b): v for b, v in cm.items()}
+                         for m, cm in raw_sens["c_kl"].items()},
+                "params": raw_sens["params"],
+                "n_perm": raw_sens.get("n_perm", n_perm)}
+        print(f"[GQ] load shapley sensitivity from {args.sens_json} "
+              f"(base_kl={sens['base_kl']:.5f})")
+    else:
+        print(f"[GQ] shapley sensitivity (P={n_perm}, sens_n={sens_n}, bits={bits_list})...")
+        sens = shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=n_perm,
+                                   group_size=group_size, symmetric=symmetric,
+                                   seed=cfg.get("seed", 2))
+        result["sens_meta"] = {"base_ear": sens["base_ear"], "base_kl": sens["base_kl"],
+                               "params": sens["params"], "n_perm": sens["n_perm"]}
+        sens_json = os.path.join(out_dir, "gq_sens.json")
+        with open(sens_json, "w", encoding="utf-8") as f:
+            json.dump({"base_ear": sens["base_ear"], "base_kl": sens["base_kl"],
+                       "c_ear": {str(m): {str(b): v for b, v in cm.items()} for m, cm in sens["c_ear"].items()},
+                       "c_kl": {str(m): {str(b): v for b, v in cm.items()} for m, cm in sens["c_kl"].items()},
+                       "params": sens["params"], "n_perm": sens["n_perm"]},
+                      f, ensure_ascii=False, indent=2)
+        print(f"[GQ] sensitivity saved to {sens_json}")
 
     # ---------- TL 单点标定 + 预测二分 + re-anchor (论文 Algorithm 2) ----------
     from slq.gptq_shapley import predicted_kl
     alpha = (1.0 - anchor_rec) / max(kl_cal, 1e-6)
     d_thresh = (1.0 - target_rec) / alpha
+    if args.thresh_scale != 1.0:
+        d_thresh_orig = d_thresh
+        d_thresh *= args.thresh_scale
+        print(f"[GQ] thresh_scale={args.thresh_scale}: D_thresh {d_thresh_orig:.5f} -> {d_thresh:.5f}")
     d_pred_anchor = predicted_kl(sens, [calib_bits] * len(groups))
     rho = kl_cal / max(d_pred_anchor, 1e-8)
     print(f"[GQ] single-point: alpha={alpha:.4f} D_thresh={d_thresh:.5f} "
@@ -178,18 +222,22 @@ def main():
               f"predicted_kl={d_pred:.5f} rho_actual={rho_actual:.4f} "
               f"ratio_vs_anchor_rho={ratio:.3f}")
 
-        if 0.5 <= ratio <= 2.0:
+        # guardrail 硬判据: 实测 KL 必须落在 (缩放后的) 阈值内 —— 线性恢复模型
+        # 在低位宽会低估实际任务损失, 单靠 ratio 检查会放行超阈值的配置 (见首轮
+        # recovery=0.9854 < 0.99)。ratio 仍作为 rho 偏离的软诊断。
+        kl_ok = kl_actual <= d_thresh
+        if 0.5 <= ratio <= 2.0 and kl_ok:
             final_alloc = alloc
             best_kl_actual = kl_actual
             result["guardrail"] = "ok"
             result["reanchor_iters"] = re_i
-            print(f"[GQ] guardrail OK at iter {re_i}")
+            print(f"[GQ] guardrail OK at iter {re_i} (kl_actual={kl_actual:.5f} <= d_thresh={d_thresh:.5f})")
             break
         # re-anchor: 用实测 KL 重估 rho, 并强制后续搜索位宽 >= 当前实测位宽
         failed_bits = desc["avg_bits"]
         rho = rho_actual
-        print(f"[GQ] guardrail violated at iter {re_i} (ratio={ratio:.3f}), "
-              f"re-anchor rho->{rho:.4f}, floor avg_bits->{failed_bits:.3f}")
+        print(f"[GQ] guardrail violated at iter {re_i} (ratio={ratio:.3f}, "
+              f"kl_ok={kl_ok}), re-anchor rho->{rho:.4f}, floor avg_bits->{failed_bits:.3f}")
         result.setdefault("reanchor_hist", []).append(
             {"iter": re_i, "avg_bits": desc["avg_bits"], "kl_actual": kl_actual,
              "predicted_kl": d_pred, "rho_actual": rho_actual, "ratio": ratio})
