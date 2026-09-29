@@ -258,3 +258,90 @@ python main_slq.py --config configs/qwen3-8b-slq-tl.yaml --mode tl
 python main_slq.py --config configs/qwen3-8b-slq-tl.yaml --mode eval \
     --apply_config /opt/zh/train/output/slq-8b/qwen3-8b-tl/slq_tl.json
 ```
+
+---
+
+# 附录 A：GPTQ + Shapley TL 版本（2026-09，最终交付）
+
+> 本附录记录 **Qwen3-8B 上 GPTQ + Multi-Bitwidth Shapley 敏感度 + 论文式 re-anchor TL 搜索**的完整复现。与正文的纯 RTN 单点标定（§3.5，avg=5.554）不同，本管线用 GPTQ 逐层量化 + Shapley 边际敏感度 + Algorithm 2 re-anchor，**最终 avg_bits=4.961，recovery=0.9974**，是 SLQ 论文对标的完整实现。
+>
+> 入口脚本：`main_gptq_shapley.py`（另有 `slq/gptq.py`、`slq/gptq_shapley.py`）；服务器容器 `slq-sgct-8b`（环境2），`/opt/zh/SLQ/SliderQuant/`。
+
+## A.1 方法与流程
+
+1. **逐层量化器 = GPTQ**（`slq/gptq.py`），group_size=128 非对称，位宽 {3..8}，Hessian=2XᵀX+damp·mean(diag)·I。
+2. **敏感度 = Multi-Bitwidth Shapley**（`slq/gptq_shapley.py`）：对每个目标位宽 b*∈B∖{bmax=8} 跑 P=2 个随机排列，全组置于 8bit 后按排列顺序逐组切换到 b*，记录每步 (EAR,KL) 边际，跨排列平均得 Shapley 值 c_m(b*)；预计算各组 bmax 与 b* 的 GPTQ 权重副本，排列内只做 `copy_`。
+3. **TL 单点标定 + 预测二分**（Algorithm 2 批注）：recovery ≈ 1−α·DKL，校准比 ρ=D_actual/D_predicted（锚点 uniform-6 处测），预测 KL  Ḋ=ρ·(base_kl+Σc_kl)，二分找最小 avg_bits 使 Ḋ≤D_thresh。
+4. **re-anchor guardrail**：收敛后实测 KL，硬判据 `kl_actual ≤ D_thresh` 不满足则用实测 KL 重估 ρ、抬升位宽下界，重新搜索（论文 Algorithm 2）。
+
+## A.2 关键修复与性能优化
+
+| # | 问题 | 修复 | 效果 |
+|---|---|---|---|
+| 1 | **双量化 bug** | shapley 预计算 Wmax/Wb 前恢复原始权重快照（`_restore_orig`） | ρ 从 ~0.016（80×膨胀）修复为 **1.0** |
+| 2 | **guardrail 误放行** | 旧判据只看 ratio∈[0.5,2]，低位宽 KL 低估致 recovery=0.985 | 加硬判据 `kl_actual≤D_thresh` + `--thresh_scale 0.7` | 
+| 3 | 逐列循环算力浪费 | Cholesky 求逆 + 整组一次性量化 + 单次矩阵乘误差补偿 | 单组 **6-10× 提速**（attn 66-100s、mlp 84-200s） |
+| 4 | shapley/guardrail 重复算同一 (组,位宽) | `gptq_cache` 磁盘缓存（键 `(m,bits)_v{版本}`） + Hessian 逆跨位宽复用 | re-anchor 迭代跨轮复用，整体收敛时间大幅缩短 |
+
+**验证**：新旧列循环在 4 组不同尺寸/位宽/对称性用例上**逐位一致（maxabs=0）**；Cholesky 求逆路径与 `torch.inverse` 一致。
+
+## A.3 TL 搜索收敛轨迹（guardrail iter0-3）
+
+`D_thresh=0.06818`（0.7×0.09741），单点 ρ=1.0（锚点 uniform-6 KL=0.0124）。
+
+| iter | avg_bits | 实际 KL | ratio vs 锚点 ρ | 判定 |
+|---|---|---|---|---|
+| 0 | 4.501 | 0.11422 | 1.705 | ✗ re-anchor |
+| 1 | 4.894 | 0.07304 | 1.080 | ✗ re-anchor |
+| 2 | 4.940 | 0.06958 | 1.022 | ✗ re-anchor |
+| **3** | **4.961** | **0.06431** | 0.956 | **✓ OK** |
+
+KL 单调 0.1142→0.0643，位宽单调 4.50→4.96；ratio 收敛至 ~1.0；最终 `kl_actual=0.064 ≤ D_thresh=0.068`。
+
+## A.4 最终位宽配置与评测
+
+**avg_bits = 4.961**，72 组参数约 6.95G 的分布：
+
+| 位宽 | 参数量 | 占比 |
+|---|---|---|
+| 3 | 192.9 M | 2.78% |
+| 4 | 947.9 M | 13.65% |
+| 5 | 4,890.6 M | 70.38% |
+| 6 | 763.4 M | 10.99% |
+| 7 | 151.0 M | 2.17% |
+
+以 5-bit 为主（70%），浅层 3-4 bit，末层（L13.attn 等最敏感）少量 7 bit。
+
+**avg-6 lm_eval 评测（BF16 vs TL 4.961bit）**：
+
+| 任务 | BF16 | TL 4.96b | 恢复率 |
+|---|---|---|---|
+| piqa | 0.77584 | 0.77367 | 0.9972 |
+| arc_easy | 0.80892 | 0.79461 | 0.9823 |
+| arc_challenge | 0.56911 | 0.55973 | 0.9835 |
+| boolq | 0.86514 | 0.86881 | 1.0042 |
+| hellaswag | 0.74895 | 0.74945 | 1.0007 |
+| winogrande | 0.67640 | 0.68666 | 1.0152 |
+| **avg** | **0.74073** | **0.73882** | **0.9974** |
+
+## A.5 结论
+
+1. **TL 达标（强结果）**：GPTQ+Shapley TL 在 **avg_bits=4.961** 达到 **recovery=0.9974 ≥ 0.99**，6 项任务整体无损（boolq/hellaswag/winogrande 甚至略升）。
+2. **双量化 bug 根治**：Shapley KL 预测与实测的 telescoping 恒等式在锚点处恢复一致（ρ=1.0），此前 80× 膨胀由二次量化引起。
+3. **re-anchor 稳健**：3 轮迭代正确拒绝低于位的配置（KL 均超阈值），逐步抬升到位宽达标——验证论文 Algorithm 2 的必要性。
+4. **比 RTN 版更优**：同 recovery 下位宽从 5.554（RTN）降到 4.961（GPTQ+Shapley），印证误差补偿 + 更细敏感度可进一步压位宽。
+
+**产物**（服务器 `/opt/zh/SLQ/SliderQuant/log/slq/qwen3-8b-gq-tl-v2/`）：
+- `gq_slq_tl.json` — 最终 TL 结果（含 alloc 72 组、reanchor_hist、逐任务分数）
+- `gq_sens.json` — Shapley 敏感度
+- `gptq_cache/*_v3.pt` — 跨迭代复用的 GPTQ 权重缓存
+- 日志：`log/gq_tl_v2b.log`
+
+**复现命令**：
+```bash
+python main_gptq_shapley.py --config configs/qwen3-8b-slq-tl.yaml --mode tl \
+  --run_name qwen3-8b-gq-tl-v2 \
+  --sens_json log/slq/qwen3-8b-gq-tl/gq_sens.json \
+  --resume_values log/slq/qwen3-8b-gq-tl/gq_slq_tl.json \
+  --thresh_scale 0.7
+```
