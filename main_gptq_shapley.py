@@ -54,6 +54,7 @@ def main():
     run_name = args.run_name or os.path.splitext(os.path.basename(args.config))[0]
     out_dir = os.path.join(args.output_dir, run_name)
     os.makedirs(out_dir, exist_ok=True)
+    gptq_cache_dir = os.path.join(out_dir, "gptq_cache")
     device = get_device()
     print(f"[GQ] device={device} config={args.config} mode={args.mode}")
 
@@ -125,7 +126,8 @@ def main():
         print(f"[GQ] resume anchor: KL={kl_cal:.5f} recovery={anchor_rec:.5f} (跳过 GPTQ/eval)")
     else:
         print(f"[GQ] anchor: uniform-{calib_bits} (GPTQ), KL + benchmark...")
-        apply_config_gptq(model, groups, [calib_bits] * len(groups), act, group_size, symmetric)
+        apply_config_gptq(model, groups, [calib_bits] * len(groups), act, group_size, symmetric,
+                          gptq_cache_dir=gptq_cache_dir)
         _, kl_cal = model_metrics(model, sens_inputs, sens_ref, device, topk=topk,
                                   temperature=temperature)
         anchor_cache = os.path.join(out_dir, f"gq_anchor_{calib_bits}b_scores.json")
@@ -166,7 +168,8 @@ def main():
         print(f"[GQ] shapley sensitivity (P={n_perm}, sens_n={sens_n}, bits={bits_list})...")
         sens = shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=n_perm,
                                    group_size=group_size, symmetric=symmetric,
-                                   seed=cfg.get("seed", 2))
+                                   seed=cfg.get("seed", 2),
+                                   gptq_cache_dir=gptq_cache_dir)
         result["sens_meta"] = {"base_ear": sens["base_ear"], "base_kl": sens["base_kl"],
                                "params": sens["params"], "n_perm": sens["n_perm"]}
         sens_json = os.path.join(out_dir, "gq_sens.json")
@@ -209,7 +212,8 @@ def main():
               f"per_bits={desc['per_bits']}")
 
         restore_weights(groups, snapshot)
-        apply_config_gptq(model, groups, alloc, act, group_size, symmetric)
+        apply_config_gptq(model, groups, alloc, act, group_size, symmetric,
+                          gptq_cache_dir=gptq_cache_dir)
         # guardrail 的 KL 必须与预测/锚点在【同一批样本】上测, 否则样本数差异本身
         # 就会污染 ratio (论文单点标定协议: 锚点与候选同协议)。sens 集用于校验,
         # 全量集只用于最终 lm_eval benchmark。

@@ -19,12 +19,13 @@
    guardrail: 收敛后实测 KL, 若实测/预测 相对 rho 偏离 > 2x 则拒绝 (重新锚定)。
 """
 import json
+import os
 import random
 
 import numpy as np
 import torch
 
-from .gptq import gptq_quantize_weight
+from .gptq import GPTQ_ALGO_VERSION, compute_hinv, gptq_quantize_weight
 
 # 位宽预算二分用 DP (多选背包, 与论文 ILP 数学等价: 最小化 sum c subject 预算)
 from .allocation import dp_allocate
@@ -90,18 +91,48 @@ def collect_activations(model, groups, inputs, device, n_rows=1024, batch=4):
     return buf
 
 
-def gptq_group_weights(groups, m, bits, act, group_size=128, symmetric=False, damp=0.01):
-    """对组 m 内每个 Linear 做 GPTQ 量化, 返回 [CPU bf16 权重列表] (不写模型)。"""
+def gptq_group_weights(groups, m, bits, act, group_size=128, symmetric=False, damp=0.01,
+                       hinv_cache=None):
+    """对组 m 内每个 Linear 做 GPTQ 量化, 返回 [CPU bf16 权重列表] (不写模型)。
+
+    hinv_cache: dict[id(mod) -> Hinv], 跨位宽复用 Hessian 逆 (与位宽无关), 省重复 inverse。
+    """
     import time
     out = []
     t0 = time.time()
     for mod in groups[m]["modules"]:
         X = act.get(id(mod))
         w = mod.weight.detach()
-        dq = gptq_quantize_weight(w, X, bits, group_size, symmetric, damp, verbose=True)
+        hinv = None
+        if hinv_cache is not None:
+            mid = id(mod)
+            if mid in hinv_cache:
+                hinv = hinv_cache[mid]
+            else:
+                hinv = compute_hinv(X, w.shape[1], damp)
+                hinv_cache[mid] = hinv
+        dq = gptq_quantize_weight(w, X, bits, group_size, symmetric, damp, verbose=True, hinv=hinv)
         out.append(dq.detach().to("cpu"))
     print(f"  [gptq-group] m={m} name={groups[m]['name']} "
           f"mods={len(groups[m]['modules'])} done in {time.time() - t0:.1f}s", flush=True)
+    return out
+
+
+def gptq_group_weights_cached(cache_dir, groups, m, bits, act, group_size=128,
+                              symmetric=False, hinv_cache=None):
+    """带磁盘缓存的 GPTQ 组量化: 键 (m, bits), 命中直接加载, 未命中计算并落盘。
+
+    用于跨运行 / 跨 re-anchor 迭代复用同一 (组, 位宽) 的量化权重副本,
+    消除 apply_config_gptq 每轮对全部 72 组重跑 GPTQ 的重复计算。
+    """
+    if cache_dir:
+        f = os.path.join(cache_dir, f"gptq_m{m}_b{bits}_v{GPTQ_ALGO_VERSION}.pt")
+        if os.path.exists(f):
+            return torch.load(f, weights_only=True)
+    out = gptq_group_weights(groups, m, bits, act, group_size, symmetric, hinv_cache=hinv_cache)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        torch.save(out, f)
     return out
 
 
@@ -120,7 +151,7 @@ def write_group(groups, m, weights):
 
 
 def shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=2,
-                        group_size=128, symmetric=False, seed=2):
+                        group_size=128, symmetric=False, seed=2, gptq_cache_dir=None):
     """多 bitwidth Shapley 敏感度估计。
 
     Returns dict:
@@ -146,9 +177,11 @@ def shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=2,
                     mod.weight.copy_(orig[i])
                     i += 1
 
+    hinv_cache = {}
     print(f"[shapley] precompute W(bmax={bmax}) for {M} groups (GPTQ)...")
     _restore_orig()  # Wmax 也须从原始权重计算
-    Wmax = [gptq_group_weights(groups, m, bmax, act, group_size, symmetric) for m in range(M)]
+    Wmax = [gptq_group_weights_cached(gptq_cache_dir, groups, m, bmax, act, group_size,
+                                      symmetric, hinv_cache) for m in range(M)]
     write_all(groups, Wmax)
     base_ear, base_kl = metrics_fn()
     print(f"[shapley] base (all bmax={bmax}) EAR={base_ear:.5f} KL={base_kl:.5f}")
@@ -159,7 +192,8 @@ def shapley_sensitivity(model, groups, act, metrics_fn, bits_list, n_perm=2,
             continue
         print(f"[shapley] bitwidth {b}: precompute W(b={b}) from ORIGINAL weights (GPTQ)...")
         _restore_orig()  # 修复二次量化: 从原始权重计算 Wb
-        Wb = [gptq_group_weights(groups, m, b, act, group_size, symmetric) for m in range(M)]
+        Wb = [gptq_group_weights_cached(gptq_cache_dir, groups, m, b, act, group_size,
+                                        symmetric, hinv_cache) for m in range(M)]
         for p in range(n_perm):
             perm = list(range(M))
             random.shuffle(perm)
@@ -230,13 +264,16 @@ def search_tl_predicted(sens, bits_list, target_kl, rho=1.0, tol_bits=0.02,
     return best, avg_bits
 
 
-def apply_config_gptq(model, groups, alloc, act, group_size=128, symmetric=False):
-    """按 alloc 位宽配置, 逐组 GPTQ 量化并原地写回。"""
+def apply_config_gptq(model, groups, alloc, act, group_size=128, symmetric=False,
+                      gptq_cache_dir=None):
+    """按 alloc 位宽配置, 逐组 GPTQ 量化并原地写回 (带磁盘缓存复用)。"""
     import time
     weights = []
+    hinv_cache = {}
     t_all = time.time()
     for m in range(len(groups)):
-        weights.append(gptq_group_weights(groups, m, int(alloc[m]), act, group_size, symmetric))
+        weights.append(gptq_group_weights_cached(gptq_cache_dir, groups, m, int(alloc[m]),
+                                                 act, group_size, symmetric, hinv_cache))
         print(f"  [apply-gptq] group {m + 1}/{len(groups)} done", flush=True)
     write_all(groups, weights)
     print(f"[apply-gptq] all {len(groups)} groups quantized in {time.time() - t_all:.1f}s", flush=True)
